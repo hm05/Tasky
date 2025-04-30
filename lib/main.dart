@@ -771,7 +771,6 @@ class TaskItem extends StatelessWidget {
   TextStyle? _getTextStyle(bool checked) {
     if (!checked) return null;
     return const TextStyle(
-      color: Colors.black54,
       decoration: TextDecoration.lineThrough,
     );
   }
