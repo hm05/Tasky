@@ -45,5 +45,9 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Tasky needs speech recognition to add tasks using voice</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Tasky needs microphone access for speech recognition</string>
 </dict>
 </plist>
