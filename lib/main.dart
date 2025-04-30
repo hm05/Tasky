@@ -1,8 +1,27 @@
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart';
+import 'models/task.dart';
+import 'services/firebase_service.dart';
+import 'services/voice_service.dart';
+import 'dart:async';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+  
+  // Initialize services
+  final firebaseService = FirebaseService();
+  final voiceService = VoiceService();
+  
+  await firebaseService.initialize();
+  await voiceService.initialize();
+  
   runApp(const TaskyApp());
 }
 
@@ -38,22 +57,88 @@ class TaskyList extends StatefulWidget {
   State<TaskyList> createState() => _TaskyListState();
 }
 
-class _TaskyListState extends State<TaskyList> {
+class _TaskyListState extends State<TaskyList> with WidgetsBindingObserver {
   final List<Task> _tasks = <Task>[];
   final TextEditingController _textFieldController = TextEditingController();
   final SpeechToText _speech = SpeechToText();
+  final FirebaseService _firebaseService = FirebaseService();
+  final VoiceService _voiceService = VoiceService();
+  final Connectivity _connectivity = Connectivity();
+  
   bool _speechEnabled = false;
+  bool _isOnline = true;
+  bool _isSyncing = false;
   String _lastWords = '';
   String _feedbackText = '';
   bool _isListening = false;
   String _filterMode = 'all'; // all, completed, pending
+  List<String> _pendingVoiceCommands = [];
+  StreamSubscription<ConnectivityResult>? _connectivitySubscription;
   
   @override
   void initState() {
     super.initState();
-    _initSpeech();
+    WidgetsBinding.instance.addObserver(this);
+    _initServices();
   }
-
+  
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _connectivitySubscription?.cancel();
+    super.dispose();
+  }
+  
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkConnectivity();
+    }
+  }
+  
+  Future<void> _initServices() async {
+    // Initialize speech recognition
+    _initSpeech();
+    
+    // Check initial connectivity
+    await _checkConnectivity();
+    
+    // Listen for connectivity changes
+    _connectivitySubscription = _connectivity.onConnectivityChanged.listen((List<ConnectivityResult> results) {
+      final result = results.isNotEmpty ? results.first : ConnectivityResult.none;
+      
+      setState(() {
+        _isOnline = result != ConnectivityResult.none;
+      });
+      
+      if (_isOnline) {
+        _syncPendingCommands();
+        if (_pendingVoiceCommands.isEmpty) {
+          _voiceService.notifySyncComplete();
+        }
+      } else {
+        _voiceService.notifyOfflineMode();
+      }
+    });
+    
+    // Subscribe to task updates
+    _firebaseService.addTaskListener((tasks) {
+      setState(() {
+        _tasks.clear();
+        _tasks.addAll(tasks);
+      });
+    });
+  }
+  
+  Future<void> _checkConnectivity() async {
+    final connectivityResult = await _connectivity.checkConnectivity();
+    final result = connectivityResult.isNotEmpty ? connectivityResult.first : ConnectivityResult.none;
+    
+    setState(() {
+      _isOnline = result != ConnectivityResult.none;
+    });
+  }
+  
   void _initSpeech() async {
     _speechEnabled = await _speech.initialize(
       onStatus: _onSpeechStatus,
@@ -61,6 +146,7 @@ class _TaskyListState extends State<TaskyList> {
         setState(() {
           _feedbackText = 'Error: ${errorNotification.errorMsg}';
         });
+        _voiceService.notifyError(errorNotification.errorMsg ?? 'Speech recognition failed');
         print('Speech error: $errorNotification');
       },
     );
@@ -107,19 +193,29 @@ class _TaskyListState extends State<TaskyList> {
       _feedbackText = 'Heard: ${result.recognizedWords}';
     });
   }
-
-  void _processVoiceCommand(String command) {
+  
+  Future<void> _processVoiceCommand(String command) async {
+    if (command.isEmpty) return;
+    
     command = command.toLowerCase();
     setState(() {
       _feedbackText = 'Processing: "$command"';
     });
 
+    // Store command for offline processing if needed
+    if (!_isOnline) {
+      _pendingVoiceCommands.add(command);
+      await _voiceService.notifyOfflineMode();
+    }
+
     // Add task command
     if (command.startsWith('add ')) {
       final taskName = command.substring(4).trim();
       if (taskName.isNotEmpty) {
-        _addTaskItem(taskName);
-        _feedbackText = 'Added task: "$taskName"';
+        await _addTaskItem(taskName);
+        await _voiceService.confirmTaskAdded(taskName);
+      } else {
+        await _voiceService.askForClarification('What task would you like to add?');
       }
     }
     
@@ -134,7 +230,11 @@ class _TaskyListState extends State<TaskyList> {
         taskText = command.substring(0, command.indexOf(' as completed')).replaceFirst('mark ', '').trim();
       }
       
-      _markTaskAsDone(taskText);
+      if (taskText.isNotEmpty) {
+        await _markTaskAsDone(taskText);
+      } else {
+        await _voiceService.askForClarification('Which task would you like to mark as complete?');
+      }
     }
     
     // Delete task command
@@ -142,7 +242,12 @@ class _TaskyListState extends State<TaskyList> {
       final taskName = command.startsWith('delete ') 
           ? command.substring(7).trim() 
           : command.substring(7).trim();
-      _deleteTaskByName(taskName);
+      
+      if (taskName.isNotEmpty) {
+        await _deleteTaskByName(taskName);
+      } else {
+        await _voiceService.askForClarification('Which task would you like to delete?');
+      }
     }
     
     // Show tasks commands
@@ -152,92 +257,136 @@ class _TaskyListState extends State<TaskyList> {
           _filterMode = 'completed';
           _feedbackText = 'Showing completed tasks';
         });
+        await _voiceService.confirmTasksFiltered('completed');
       } else if (command.contains('pending') || command.contains('incomplete') || command.contains('not complete')) {
         setState(() {
           _filterMode = 'pending';
           _feedbackText = 'Showing pending tasks';
         });
+        await _voiceService.confirmTasksFiltered('pending');
       } else if (command.contains('all')) {
         setState(() {
           _filterMode = 'all';
           _feedbackText = 'Showing all tasks';
         });
+        await _voiceService.confirmTasksFiltered('all');
       }
     }
     
     // Edit task command
     else if (command.contains('change ') || command.contains('edit ') || command.contains('update ')) {
-      _processEditCommand(command);
+      await _processEditCommand(command);
     }
     
     // Help command
     else if (command.contains('help') || command.contains('commands')) {
       _showHelpDialog();
+      await _voiceService.speak('Here are the available voice commands.');
     }
     
     else {
       setState(() {
         _feedbackText = 'Unrecognized command. Say "help" for assistance.';
       });
+      await _voiceService.speak('I didn\'t understand that command. Say "help" to see available commands.');
     }
   }
   
-  void _addTaskItem(String name) {
+  Future<void> _syncPendingCommands() async {
+    if (_pendingVoiceCommands.isEmpty) return;
+    
     setState(() {
-      _tasks.add(Task(name: name, completed: false));
-      _textFieldController.clear();
+      _isSyncing = true;
     });
+    
+    final commands = List<String>.from(_pendingVoiceCommands);
+    _pendingVoiceCommands.clear();
+    
+    for (var command in commands) {
+      await _processVoiceCommand(command);
+    }
+    
+    setState(() {
+      _isSyncing = false;
+    });
+  }
+  
+  Future<void> _addTaskItem(String name) async {
+    await _firebaseService.addTask(name);
+    _textFieldController.clear();
   }
 
-  void _handleTaskChange(Task task) {
-    setState(() {
-      task.completed = !task.completed;
-    });
+  void _handleTaskChange(Task task) async {
+    final updatedTask = task.copyWith(
+      completed: !task.completed,
+    );
+    await _firebaseService.updateTask(updatedTask);
+    
+    if (updatedTask.completed) {
+      await _voiceService.confirmTaskCompleted(updatedTask.name);
+    }
   }
 
-  void _deleteTask(Task task) {
-    setState(() {
-      _tasks.removeWhere((element) => element.name == task.name);
-    });
+  Future<void> _deleteTask(Task task) async {
+    await _firebaseService.deleteTask(task);
+    await _voiceService.confirmTaskDeleted(task.name);
   }
   
-  void _markTaskAsDone(String taskName) {
+  Future<void> _markTaskAsDone(String taskName) async {
     bool found = false;
-    setState(() {
-      for (var task in _tasks) {
-        if (task.name.toLowerCase().contains(taskName.toLowerCase())) {
-          task.completed = true;
+    for (var task in _tasks) {
+      if (task.name.toLowerCase().contains(taskName.toLowerCase())) {
+        if (!task.completed) {
+          final updatedTask = task.copyWith(completed: true);
+          await _firebaseService.updateTask(updatedTask);
           found = true;
-          _feedbackText = 'Marked "${task.name}" as complete';
-          break;
+          await _voiceService.confirmTaskCompleted(task.name);
+        } else {
+          found = true;
+          await _voiceService.speak('${task.name} is already completed.');
         }
+        break;
       }
-      if (!found) {
+    }
+    
+    if (!found) {
+      await _voiceService.speak('I couldn\'t find a task containing "$taskName".');
+      setState(() {
         _feedbackText = 'Could not find task: "$taskName"';
-      }
-    });
+      });
+    }
   }
   
-  void _deleteTaskByName(String taskName) {
+  Future<void> _deleteTaskByName(String taskName) async {
     bool found = false;
-    setState(() {
-      for (var i = 0; i < _tasks.length; i++) {
-        if (_tasks[i].name.toLowerCase().contains(taskName.toLowerCase())) {
-          _tasks.removeAt(i);
-          found = true;
-          _feedbackText = 'Deleted task containing: "$taskName"';
-          break;
-        }
+    List<Task> matchingTasks = [];
+    
+    for (var task in _tasks) {
+      if (task.name.toLowerCase().contains(taskName.toLowerCase())) {
+        matchingTasks.add(task);
       }
-      if (!found) {
+    }
+    
+    if (matchingTasks.isEmpty) {
+      await _voiceService.speak('I couldn\'t find a task containing "$taskName".');
+      setState(() {
         _feedbackText = 'Could not find task: "$taskName"';
-      }
-    });
+      });
+      return;
+    } else if (matchingTasks.length > 1) {
+      await _voiceService.speak('I found multiple tasks containing "$taskName". Please be more specific.');
+      _showTaskSelectionDialog(matchingTasks, (selectedTask) async {
+        await _firebaseService.deleteTask(selectedTask);
+        await _voiceService.confirmTaskDeleted(selectedTask.name);
+      });
+      return;
+    }
+    
+    await _firebaseService.deleteTask(matchingTasks[0]);
+    await _voiceService.confirmTaskDeleted(matchingTasks[0].name);
   }
   
-  void _processEditCommand(String command) {
-    // Command format: "change X to Y" or "edit X to Y"
-    String originalCommand = command;
+  Future<void> _processEditCommand(String command) async {
     RegExp editRegex = RegExp(r'(change|edit|update)\s+(.+?)\s+to\s+(.+)');
     var match = editRegex.firstMatch(command);
     
@@ -245,25 +394,73 @@ class _TaskyListState extends State<TaskyList> {
       String oldTaskPart = match.group(2)!;
       String newTaskDesc = match.group(3)!;
       
-      bool found = false;
-      setState(() {
-        for (var task in _tasks) {
-          if (task.name.toLowerCase().contains(oldTaskPart.toLowerCase())) {
-            task.name = newTaskDesc;
-            found = true;
-            _feedbackText = 'Updated task to: "$newTaskDesc"';
-            break;
-          }
+      List<Task> matchingTasks = [];
+      for (var task in _tasks) {
+        if (task.name.toLowerCase().contains(oldTaskPart.toLowerCase())) {
+          matchingTasks.add(task);
         }
-        if (!found) {
-          _feedbackText = 'Could not find task containing: "$oldTaskPart"';
-        }
-      });
+      }
+      
+      if (matchingTasks.isEmpty) {
+        await _voiceService.speak('I couldn\'t find a task containing "$oldTaskPart".');
+        setState(() {
+          _feedbackText = 'Could not find task: "$oldTaskPart"';
+        });
+      } else if (matchingTasks.length > 1) {
+        await _voiceService.speak('I found multiple tasks containing "$oldTaskPart". Please select one to update.');
+        _showTaskSelectionDialog(matchingTasks, (selectedTask) async {
+          final updatedTask = selectedTask.copyWith(name: newTaskDesc);
+          await _firebaseService.updateTask(updatedTask);
+          await _voiceService.speak('Updated task to "$newTaskDesc"');
+        });
+      } else {
+        final task = matchingTasks[0];
+        final updatedTask = task.copyWith(name: newTaskDesc);
+        await _firebaseService.updateTask(updatedTask);
+        await _voiceService.speak('Updated task to "$newTaskDesc"');
+      }
     } else {
+      await _voiceService.speak('I didn\'t understand your edit command. Please try again with "edit [task] to [new description]"');
       setState(() {
         _feedbackText = 'Edit command not recognized. Try "edit [task] to [new description]"';
       });
     }
+  }
+  
+  void _showTaskSelectionDialog(List<Task> tasks, Function(Task) onTaskSelected) {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Select a Task'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: tasks.length,
+              itemBuilder: (context, index) {
+                return ListTile(
+                  title: Text(tasks[index].name),
+                  subtitle: Text(tasks[index].completed ? 'Completed' : 'Pending'),
+                  onTap: () {
+                    Navigator.of(context).pop();
+                    onTaskSelected(tasks[index]);
+                  },
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text('Cancel'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   List<Task> _getFilteredTasks() {
@@ -330,8 +527,29 @@ class _TaskyListState extends State<TaskyList> {
     
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.title),
+        title: Row(
+          children: [
+            Text(widget.title),
+            if (_isSyncing)
+              const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                ),
+              ),
+          ],
+        ),
         actions: [
+          // Online/offline indicator
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Icon(
+              _isOnline ? Icons.cloud_done : Icons.cloud_off,
+              color: _isOnline ? Colors.green : Colors.grey,
+            ),
+          ),
+          // Filter menu
           PopupMenuButton<String>(
             onSelected: (value) {
               setState(() {
@@ -384,6 +602,24 @@ class _TaskyListState extends State<TaskyList> {
               ],
             ),
           ),
+          
+          // Pending commands indicator
+          if (_pendingVoiceCommands.isNotEmpty)
+            Container(
+              padding: const EdgeInsets.all(8.0),
+              color: Colors.amber.withOpacity(0.2),
+              child: Row(
+                children: [
+                  const Icon(Icons.pending_actions, color: Colors.amber),
+                  const SizedBox(width: 8),
+                  Text(
+                    '${_pendingVoiceCommands.length} command${_pendingVoiceCommands.length > 1 ? 's' : ''} pending sync',
+                    style: const TextStyle(color: Colors.amber, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+            ),
+            
           // Filter indicator
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -520,12 +756,6 @@ class _TaskyListState extends State<TaskyList> {
   }
 }
 
-class Task {
-  Task({required this.name, required this.completed});
-  String name;
-  bool completed;
-}
-
 class TaskItem extends StatelessWidget {
   const TaskItem({
     required this.task,
@@ -553,8 +783,6 @@ class TaskItem extends StatelessWidget {
         onTaskChanged(task);
       },
       leading: Checkbox(
-        checkColor: Colors.greenAccent,
-        activeColor: Colors.red,
         value: task.completed,
         onChanged: (value) {
           onTaskChanged(task);
@@ -567,10 +795,7 @@ class TaskItem extends StatelessWidget {
           ),
           IconButton(
             iconSize: 24,
-            icon: const Icon(
-              Icons.delete,
-              color: Colors.red,
-            ),
+            icon: const Icon(Icons.delete, color: Colors.red),
             onPressed: () {
               removeTask(task);
             },
